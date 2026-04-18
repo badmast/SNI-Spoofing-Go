@@ -1,11 +1,10 @@
 package packet
 
-// tcp.go — Raw TCP/IP header accessors for WinDivert captured packets.
+// tcp.go — Raw IPv4/TCP header accessors for captured packet byte slices.
 //
-// WinDivert (via godivert) gives us high-level helpers for IP addresses and
-// ports, but we need direct access to TCP flags, sequence/ack numbers, and
-// the ability to modify the payload and IP header fields. This file provides
-// low-level read/write helpers operating directly on the raw packet byte slice.
+// Windows uses WinDivert; Linux uses nfqueue. Both paths need TCP flags, sequence
+// and ack numbers, and updates to IP length / DF and payload. These helpers read
+// and write the raw IPv4 and TCP headers in place.
 //
 // IPv4 Header layout (20 bytes, no options assumed here):
 //   Offset  0: Version(4b) + IHL(4b)
@@ -114,6 +113,17 @@ func SetIPv4Ident(raw []byte, ident uint16) {
 		return
 	}
 	binary.BigEndian.PutUint16(raw[4:6], ident)
+}
+
+// ClearIPv4DontFragment clears the IPv4 DF (Don't Fragment) bit so the stack may
+// fragment oversized datagrams. Injection uses raw sockets; Linux rejects
+// sendto(EMSGSIZE) when a single IP packet exceeds the MTU with DF set.
+func ClearIPv4DontFragment(raw []byte) {
+	if len(raw) < 7 || IPVersion(raw) != 4 {
+		return
+	}
+	// Flags are the high 3 bits of the 16-bit fragment field; DF is bit 6 of byte 6 (RFC 791).
+	raw[6] &^= 0x40
 }
 
 // ------------------------------------------------------------------

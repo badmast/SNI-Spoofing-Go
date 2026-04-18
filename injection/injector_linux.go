@@ -14,6 +14,7 @@ import (
 	"time"
 
 	nfqueue "github.com/florianl/go-nfqueue/v2"
+	"golang.org/x/sys/unix"
 
 	"sni-spoofing-go/connection"
 	"sni-spoofing-go/packet"
@@ -22,6 +23,9 @@ import (
 const (
 	nfqueueNum uint16 = 100
 	fwMark     int    = 0x1337
+
+	// Used when NIC MTU is unknown or computed MSS would be invalid.
+	fallbackTCPPayloadMax = 1000
 )
 
 // FakeTcpInjector intercepts TCP packets via nfqueue and injects fake
@@ -33,21 +37,30 @@ type FakeTcpInjector struct {
 	interfaceIP string
 	connectIP   string
 	connectPort uint16
-	ctx         context.Context
-	cancel      context.CancelFunc
+	// nicMTU is the egress interface MTU for interfaceIP (0 = unknown).
+	nicMTU int
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewFakeTcpInjector creates a new nfqueue-based injector and sets up iptables rules.
 func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*FakeTcpInjector, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	mtu := nicMTUForLocalIPv4(interfaceIP)
 	f := &FakeTcpInjector{
 		interfaceIP: interfaceIP,
 		connectIP:   connectIP,
 		connectPort: connectPort,
+		nicMTU:      mtu,
 		ctx:         ctx,
 		cancel:      cancel,
 		rawFd:       -1,
+	}
+	if mtu > 0 {
+		log.Printf("injector: NIC MTU %d for %s", mtu, interfaceIP)
+	} else {
+		log.Printf("injector: could not resolve NIC MTU for %s, using fallback MSS %d", interfaceIP, fallbackTCPPayloadMax)
 	}
 
 	// Create raw socket for injecting fake packets
@@ -60,6 +73,12 @@ func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*Fak
 	syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
 	// Mark packets so iptables skips nfqueue for them
 	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_MARK, fwMark)
+	// Allow IP fragmentation when DF is cleared (oversized injection datagrams).
+	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DONT); err != nil {
+		syscall.Close(fd)
+		cancel()
+		return nil, fmt.Errorf("IP_MTU_DISCOVER: %w", err)
+	}
 	f.rawFd = fd
 
 	// Set up iptables rules
@@ -86,6 +105,66 @@ func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*Fak
 	f.nf = nf
 
 	return f, nil
+}
+
+// nicMTUForLocalIPv4 returns the MTU of the interface that owns localIPv4, or 0.
+func nicMTUForLocalIPv4(localIPv4 string) int {
+	ip := net.ParseIP(localIPv4)
+	if ip == nil {
+		return 0
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return 0
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return 0
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var cand net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				cand = v.IP
+			case *net.IPAddr:
+				cand = v.IP
+			default:
+				continue
+			}
+			cand = cand.To4()
+			if cand == nil || !cand.Equal(ip4) {
+				continue
+			}
+			return iface.MTU
+		}
+	}
+	return 0
+}
+
+// segmentMSS returns max TCP payload bytes per injected packet from NIC MTU and template IPv4/TCP headers.
+func segmentMSS(nicMTU int, template []byte) int {
+	if nicMTU <= 0 || packet.IPVersion(template) != 4 {
+		return fallbackTCPPayloadMax
+	}
+	ipLen := packet.IPHeaderLen(template)
+	tcpLen := packet.TCPDataOffset(template)
+	if ipLen < 20 || tcpLen < 20 {
+		return fallbackTCPPayloadMax
+	}
+	overhead := ipLen + tcpLen
+	if nicMTU <= overhead {
+		return fallbackTCPPayloadMax
+	}
+	mss := nicMTU - overhead
+	if mss < 128 {
+		return fallbackTCPPayloadMax
+	}
+	return mss
 }
 
 // setupIptables adds iptables rules to redirect relevant TCP packets to nfqueue.
@@ -403,39 +482,68 @@ func (f *FakeTcpInjector) fakeSendThread(rawCopy []byte, conn *FakeInjectiveConn
 		return
 	}
 
-	// Build the fake packet from the captured ACK
-	packet.SetTCPFlag(rawCopy, "psh", true)
-	newRaw := packet.SetTCPPayload(rawCopy, conn.FakeData)
-	if newRaw == nil {
-		log.Printf("SetTCPPayload: invalid or truncated TCP/IP packet")
+	if conn.BypassMethod != "wrong_seq" {
+		log.Printf("not implemented bypass method: %s", conn.BypassMethod)
 		conn.AbortUnexpectedCloseLocked()
 		return
 	}
 
-	if conn.BypassMethod == "wrong_seq" {
-		payloadLen := uint32(len(conn.FakeData))
-		wrongSeq := (uint32(conn.SynSeq) + 1 - payloadLen) & 0xffffffff
-		packet.SetTCPSeqNum(newRaw, wrongSeq)
-
-		if packet.IPVersion(newRaw) == 4 {
-			ident := packet.IPv4Ident(newRaw)
-			packet.SetIPv4Ident(newRaw, (ident+1)&0xffff)
-		}
-
-		// Compute checksums (kernel won't do this for IPPROTO_RAW)
-		computeIPChecksum(newRaw)
-		computeTCPChecksum(newRaw)
-
-		if err := f.sendRawPacket(newRaw); err != nil {
-			log.Printf("raw socket send error: %v", err)
-			conn.AbortUnexpectedCloseLocked()
-			return
-		}
-		conn.FakeSent = true
-	} else {
-		log.Printf("not implemented bypass method: %s", conn.BypassMethod)
+	if err := f.injectWrongSeqClientHello(rawCopy, conn); err != nil {
+		log.Printf("inject fake ClientHello: %v", err)
 		conn.AbortUnexpectedCloseLocked()
+		return
 	}
+	conn.FakeSent = true
+}
+
+// injectWrongSeqClientHello sends one or more TCP segments for conn.FakeData using
+// wrong-seq semantics. Large TLS ClientHellos are split so each IP packet fits the MTU.
+func (f *FakeTcpInjector) injectWrongSeqClientHello(template []byte, conn *FakeInjectiveConnection) error {
+	payload := conn.FakeData
+	total := len(payload)
+	if total == 0 {
+		return fmt.Errorf("empty FakeData")
+	}
+
+	baseWrongSeq := (uint32(conn.SynSeq) + 1 - uint32(total)) & 0xffffffff
+	baseIdent := uint16(0)
+	if packet.IPVersion(template) == 4 {
+		baseIdent = packet.IPv4Ident(template)
+	}
+
+	mss := segmentMSS(f.nicMTU, template)
+	chunkIdx := 0
+	for off := 0; off < total; off += mss {
+		end := off + mss
+		if end > total {
+			end = total
+		}
+		chunk := payload[off:end]
+		isLast := end == total
+
+		pkt := packet.SetTCPPayload(template, chunk)
+		if pkt == nil {
+			return fmt.Errorf("SetTCPPayload: invalid TCP/IP packet")
+		}
+		packet.SetTCPSeqNum(pkt, baseWrongSeq+uint32(off))
+		if isLast {
+			packet.SetTCPFlag(pkt, "psh", true)
+		} else {
+			packet.SetTCPFlag(pkt, "psh", false)
+		}
+		if packet.IPVersion(pkt) == 4 {
+			packet.SetIPv4Ident(pkt, (baseIdent+1+uint16(chunkIdx))&0xffff)
+			packet.ClearIPv4DontFragment(pkt)
+		}
+		chunkIdx++
+
+		computeIPChecksum(pkt)
+		computeTCPChecksum(pkt)
+		if err := f.sendRawPacket(pkt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // computeIPChecksum calculates and sets the IPv4 header checksum.

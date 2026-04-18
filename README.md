@@ -53,47 +53,16 @@ make windows
 make windows-bundle
 ```
 
-### Configure
-
-Create `config.json`:
-
-```json
-{
-  "LISTEN_HOST": "0.0.0.0",
-  "LISTEN_PORT": 40443,
-  "CONNECT_IP": "188.114.98.0",
-  "CONNECT_PORT": 443,
-  "FAKE_SNI": "auth.vercel.com"
-}
-```
-
 ### Run
 
+Configuration is **CLI flags only**: `-listen` and `-connect` are required; `-fake-sni` is optional when `-connect` uses a hostname (SNI defaults to that hostname). See `-h` for `-utls` presets.
+
 ```bash
-# Windows (as Administrator)
-# put config.json, WinDivert.dll, WinDivert64.sys next to the exe
-.\sni-spoofing.exe -config .\config.json
+# Windows (as Administrator) — put WinDivert.dll, WinDivert64.sys next to the exe
+.\sni-spoofing.exe -listen 127.0.0.1:40443 -connect 188.114.98.0:443 -fake-sni auth.vercel.com
 
 # Linux/OpenWrt (as root)
-sudo ./sni-spoofing-linux-amd64 -config ./config.json
-```
-
-### Arguments
-
-You can configure the app in exactly **one** of these ways:
-
-- **Config file**: `-config <path>` (or `-c <path>`)
-- **Flags**: `-listen <host:port> -connect <ipv4:port> -fake-sni <hostname>`
-- **Default**: no args → loads `config.json` next to the binary (or from the current directory)
-
-Examples:
-
-```bash
-# file
-sudo ./sni-spoofing-linux-amd64 -config ./config.json
-
-# flags (all three required together)
-sudo ./sni-spoofing-linux-amd64 -listen 127.0.0.1:8080 -connect 188.114.98.0:443 -fake-sni auth.vercel.com
+sudo ./sni-spoofing-linux-amd64 -listen 127.0.0.1:40443 -connect 188.114.98.0:443 -fake-sni auth.vercel.com
 ```
 
 ### Docker (prebuilt image)

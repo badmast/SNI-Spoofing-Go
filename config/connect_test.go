@@ -1,0 +1,49 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestConnectFromCLI_hostnameDefaultSNI(t *testing.T) {
+	cfg, err := ConnectFromCLI("127.0.0.1:8080", "localhost:443", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FakeSNI != "localhost" {
+		t.Fatalf("FakeSNI = %q", cfg.FakeSNI)
+	}
+	if cfg.ConnectIP != "127.0.0.1" {
+		t.Fatalf("ConnectIP = %q", cfg.ConnectIP)
+	}
+}
+
+func TestConnectFromCLI_hostnameFakeSNIOverride(t *testing.T) {
+	cfg, err := ConnectFromCLI("127.0.0.1:8080", "localhost:443", "other.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FakeSNI != "other.test" {
+		t.Fatalf("FakeSNI = %q", cfg.FakeSNI)
+	}
+}
+
+func TestConnectFromCLI_IPRequiresFakeSNI(t *testing.T) {
+	_, err := ConnectFromCLI("127.0.0.1:8080", "198.51.100.2:443", "")
+	if err == nil {
+		t.Fatal("expected error for IPv4 connect without -fake-sni")
+	}
+	if !strings.Contains(err.Error(), "fake-sni") {
+		t.Fatalf("unexpected err: %v", err)
+	}
+}
+
+func TestConnectFromCLI_IPWithFakeSNI(t *testing.T) {
+	cfg, err := ConnectFromCLI("127.0.0.1:8080", "198.51.100.2:443", "allowed.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FakeSNI != "allowed.example.com" || cfg.ConnectIP != "198.51.100.2" {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+}
