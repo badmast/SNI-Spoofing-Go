@@ -1,6 +1,3 @@
-// Package connection provides the MonitorConnection struct that tracks
-// the TCP handshake state for a single connection being monitored by
-// the packet injector.
 package connection
 
 import (
@@ -8,8 +5,6 @@ import (
 	"sync"
 )
 
-// ConnID uniquely identifies a TCP connection as a 4-tuple:
-// (source IP, source port, destination IP, destination port).
 type ConnID struct {
 	SrcIP   string
 	SrcPort uint16
@@ -17,23 +12,19 @@ type ConnID struct {
 	DstPort uint16
 }
 
-// MonitorConnection holds the state for a single TCP connection being
-// monitored by the WinDivert packet injector. It tracks the SYN and
-// SYN-ACK sequence numbers observed during the TCP three-way handshake.
 type MonitorConnection struct {
-	Monitor   bool   // Whether this connection is still being monitored
-	SynSeq    int64  // Sequence number from the SYN packet (-1 = not yet seen)
-	SynAckSeq int64  // Sequence number from the SYN-ACK packet (-1 = not yet seen)
-	SrcIP     string // Local source IP
-	DstIP     string // Remote destination IP
-	SrcPort   uint16 // Local source port
-	DstPort   uint16 // Remote destination port
-	ID        ConnID // Connection identifier tuple
+	Monitor   bool
+	SynSeq    int64
+	SynAckSeq int64
+	SrcIP     string
+	DstIP     string
+	SrcPort   uint16
+	DstPort   uint16
+	ID        ConnID
 	Mu        sync.Mutex
-	Sock      net.Conn // The outgoing TCP connection
+	Sock      net.Conn
 }
 
-// NewMonitorConnection creates a new MonitorConnection with initial state.
 func NewMonitorConnection(sock net.Conn, srcIP, dstIP string, srcPort, dstPort uint16) *MonitorConnection {
 	return &MonitorConnection{
 		Monitor:   true,

@@ -11,12 +11,10 @@ import (
 	"sni-spoofing-go/injection"
 )
 
-// dialOutgoing creates and registers an outgoing TCP connection.
-// On Windows, uses syscall.Bind inside Dialer.Control to get the source port
-// and register with WinDivert BEFORE the SYN packet is sent.
 func dialOutgoing(
 	interfaceIPv4, connectIP string, connectPort int,
 	fakeData []byte, bypassMethod string,
+	fakeRepeat int,
 	incomingSock net.Conn,
 	fakeInjector *injection.FakeTcpInjector,
 ) (outgoingSock net.Conn, conn *injection.FakeInjectiveConnection, srcPort uint16, err error) {
@@ -63,7 +61,7 @@ func dialOutgoing(
 
 			conn = injection.NewFakeInjectiveConnection(
 				nil, interfaceIPv4, connectIP, srcPort, uint16(connectPort),
-				fakeData, bypassMethod, incomingSock,
+				fakeData, bypassMethod, incomingSock, fakeRepeat,
 			)
 			fakeInjector.Connections.Store(conn.ID, conn)
 			registered = true

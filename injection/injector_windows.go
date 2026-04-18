@@ -14,15 +14,11 @@ import (
 	"sni-spoofing-go/packet"
 )
 
-// FakeTcpInjector intercepts TCP packets via WinDivert and injects fake
-// TLS ClientHello packets with wrong sequence numbers to fool DPI.
 type FakeTcpInjector struct {
 	wd          *godivert.WinDivertHandle
-	Connections sync.Map // map[connection.ConnID]*FakeInjectiveConnection
+	Connections sync.Map
 }
 
-// NewFakeTcpInjector creates a new FakeTcpInjector with a WinDivert filter
-// built from the given interface IP and target address.
 func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*FakeTcpInjector, error) {
 	filter := fmt.Sprintf(
 		"tcp and ((ip.SrcAddr == %s and ip.DstAddr == %s) or (ip.SrcAddr == %s and ip.DstAddr == %s))",
@@ -35,7 +31,6 @@ func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*Fak
 	return &FakeTcpInjector{wd: wd}, nil
 }
 
-// Start runs the packet capture loop (blocks forever, call in a goroutine).
 func (f *FakeTcpInjector) Start() {
 	for {
 		pkt, err := f.wd.Recv()
@@ -47,14 +42,12 @@ func (f *FakeTcpInjector) Start() {
 	}
 }
 
-// Close stops the WinDivert handle.
 func (f *FakeTcpInjector) Close() {
 	if f.wd != nil {
 		f.wd.Close()
 	}
 }
 
-// sendPacket re-injects a packet into the network stack.
 func (f *FakeTcpInjector) sendPacket(pkt *godivert.Packet, recalc bool) error {
 	if recalc {
 		pkt.CalcNewChecksum(f.wd)
@@ -66,44 +59,52 @@ func (f *FakeTcpInjector) sendPacket(pkt *godivert.Packet, recalc bool) error {
 	return err
 }
 
-// fakeSendThread injects the fake ClientHello with a wrong sequence number.
 func (f *FakeTcpInjector) fakeSendThread(rawCopy []byte, addr *godivert.WinDivertAddress, conn *FakeInjectiveConnection) {
-	time.Sleep(1 * time.Millisecond)
-
 	conn.Mu.Lock()
 	defer conn.Mu.Unlock()
+
+	time.Sleep(1 * time.Millisecond)
 
 	if !conn.Monitor {
 		return
 	}
 
-	packet.SetTCPFlag(rawCopy, "psh", true)
-	newRaw := packet.SetTCPPayload(rawCopy, conn.FakeData)
-	if newRaw == nil {
-		log.Printf("SetTCPPayload: invalid or truncated TCP/IP packet")
-		conn.AbortUnexpectedCloseLocked()
-		return
-	}
-
 	if conn.BypassMethod == "wrong_seq" {
+		repeat := conn.FakeRepeat
+		if repeat < 1 {
+			repeat = 1
+		}
 		payloadLen := uint32(len(conn.FakeData))
 		wrongSeq := (uint32(conn.SynSeq) + 1 - payloadLen) & 0xffffffff
-		packet.SetTCPSeqNum(newRaw, wrongSeq)
-
-		if packet.IPVersion(newRaw) == 4 {
-			ident := packet.IPv4Ident(newRaw)
-			packet.SetIPv4Ident(newRaw, (ident+1)&0xffff)
-		}
-
-		addrCopy := *addr
-		fakePkt := &godivert.Packet{
-			Raw:       newRaw,
-			Addr:      &addrCopy,
-			PacketLen: uint(len(newRaw)),
-		}
-		if err := f.sendPacket(fakePkt, true); err != nil {
-			conn.AbortUnexpectedCloseLocked()
-			return
+		for i := 0; i < repeat; i++ {
+			pktData := append([]byte(nil), rawCopy...)
+			packet.SetTCPFlag(pktData, "psh", true)
+			one := packet.SetTCPPayload(pktData, conn.FakeData)
+			if one == nil {
+				log.Printf("SetTCPPayload: invalid or truncated TCP/IP packet")
+				conn.AbortUnexpectedCloseLocked()
+				return
+			}
+			packet.SetTCPSeqNum(one, wrongSeq)
+			if packet.IPVersion(one) == 4 {
+				ident := packet.IPv4Ident(one)
+				packet.SetIPv4Ident(one, (ident+1+uint16(i))&0xffff)
+			}
+			addrCopy := *addr
+			fakePkt := &godivert.Packet{
+				Raw:       one,
+				Addr:      &addrCopy,
+				PacketLen: uint(len(one)),
+			}
+			if err := f.sendPacket(fakePkt, true); err != nil {
+				conn.AbortUnexpectedCloseLocked()
+				return
+			}
+			log.Printf("injector: fake TLS ClientHello %d/%d sent (%d bytes, 1 TCP segment)",
+				i+1, repeat, len(conn.FakeData))
+			if i+1 < repeat {
+				time.Sleep(2 * time.Millisecond)
+			}
 		}
 		conn.FakeSent = true
 	} else {
@@ -112,7 +113,6 @@ func (f *FakeTcpInjector) fakeSendThread(rawCopy []byte, addr *godivert.WinDiver
 	}
 }
 
-// onUnexpectedPacket handles packets not matching the handshake state machine.
 func (f *FakeTcpInjector) onUnexpectedPacket(pkt *godivert.Packet, conn *FakeInjectiveConnection, info string) {
 	fmt.Println(info, packet.PacketSummary(pkt.Raw))
 	if conn.Sock != nil {
@@ -129,7 +129,6 @@ func (f *FakeTcpInjector) onUnexpectedPacket(pkt *godivert.Packet, conn *FakeInj
 	f.sendPacket(pkt, false)
 }
 
-// onInboundPacket processes packets arriving from the remote server.
 func (f *FakeTcpInjector) onInboundPacket(pkt *godivert.Packet, conn *FakeInjectiveConnection) {
 	raw := pkt.Raw
 
@@ -174,8 +173,6 @@ func (f *FakeTcpInjector) onInboundPacket(pkt *godivert.Packet, conn *FakeInject
 			return
 		}
 		conn.Monitor = false
-		// Must reinject like every other WinDivert path; otherwise the ACK never reaches
-		// the local TCP stack (Linux uses NfAccept for the same packet).
 		f.sendPacket(pkt, false)
 		select {
 		case conn.T2aChan <- "fake_data_ack_recv":
@@ -187,7 +184,6 @@ func (f *FakeTcpInjector) onInboundPacket(pkt *godivert.Packet, conn *FakeInject
 	f.onUnexpectedPacket(pkt, conn, "unexpected inbound packet")
 }
 
-// onOutboundPacket processes packets going to the remote server.
 func (f *FakeTcpInjector) onOutboundPacket(pkt *godivert.Packet, conn *FakeInjectiveConnection) {
 	raw := pkt.Raw
 
@@ -242,7 +238,6 @@ func (f *FakeTcpInjector) onOutboundPacket(pkt *godivert.Packet, conn *FakeInjec
 	f.onUnexpectedPacket(pkt, conn, "unexpected outbound packet")
 }
 
-// inject processes a single WinDivert-captured packet.
 func (f *FakeTcpInjector) inject(pkt *godivert.Packet) {
 	raw := pkt.Raw
 	if len(raw) < 40 {
@@ -250,7 +245,6 @@ func (f *FakeTcpInjector) inject(pkt *godivert.Packet) {
 		return
 	}
 
-	// IPv4 only: pass through non-IPv4 packets unchanged.
 	if packet.IPVersion(raw) != 4 {
 		f.sendPacket(pkt, false)
 		return

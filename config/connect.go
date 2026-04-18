@@ -9,9 +9,6 @@ import (
 	"sni-spoofing-go/network"
 )
 
-// ConnectFromCLI builds a Config from -listen, -connect, and optional -fake-sni.
-// If -connect uses a hostname, the injected SNI defaults to that hostname unless fakeSNIOverride is set.
-// If -connect uses an IPv4 address, fakeSNIOverride must be non-empty (no default SNI).
 func ConnectFromCLI(listenAddr, connectAddr, fakeSNIOverride string) (*Config, error) {
 	listenHost, listenPortStr, err := net.SplitHostPort(listenAddr)
 	if err != nil {

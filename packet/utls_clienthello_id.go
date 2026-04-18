@@ -8,11 +8,8 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-// DefaultClientHelloID is used when -utls is omitted.
 var DefaultClientHelloID = utls.HelloChrome_Auto
 
-// presetClientHelloIDs lists every uTLS ClientHelloID accepted by -utls.
-// Duplicate *Auto entries are omitted (same fingerprint as an explicit version below).
 var presetClientHelloIDs = []utls.ClientHelloID{
 	utls.HelloGolang, utls.HelloCustom,
 	utls.HelloRandomized, utls.HelloRandomizedALPN, utls.HelloRandomizedNoALPN,
@@ -32,8 +29,6 @@ var presetClientHelloIDs = []utls.ClientHelloID{
 	utls.HelloQQ_11_1,
 }
 
-// browserAutoAliases maps a short browser name to uTLS's *Auto preset (same as Hello*_Auto in code).
-// No "auto" in the key — e.g. "chrome" -> HelloChrome_Auto (Chrome-133 in this fork).
 var browserAutoAliases = map[string]utls.ClientHelloID{
 	"chrome":     utls.HelloChrome_Auto,
 	"firefox":    utls.HelloFirefox_Auto,
@@ -56,9 +51,6 @@ func init() {
 	}
 }
 
-// canonicalUTLSKey is the lowercase, underscored form for listing and primary CLI names.
-// When uTLS uses version "0" as a placeholder (Golang, Custom, Randomized*, etc.), the
-// canonical name is only the client part — no trailing _0.
 func canonicalUTLSKey(id utls.ClientHelloID) string {
 	if id.Version == "0" {
 		c := strings.ToLower(id.Client)
@@ -84,8 +76,6 @@ func registerPresetKeys(id utls.ClientHelloID) {
 	}
 }
 
-// UTLSHelpGroupedCSV returns valid -utls preset names for usage text: one line per
-// uTLS client family (e.g. Chrome, Firefox), comma-separated, without a line prefix.
 func UTLSHelpGroupedCSV() string {
 	groups := make(map[string]map[string]struct{})
 	add := func(client, name string) {
@@ -126,14 +116,10 @@ func UTLSHelpGroupedCSV() string {
 	return b.String()
 }
 
-// DefaultUTLSSummary is the user-facing name for the default preset in help text (short browser alias).
 func DefaultUTLSSummary() string {
 	return "chrome"
 }
 
-// ParseClientHelloID resolves a user string to utls.ClientHelloID.
-// Empty string selects DefaultClientHelloID.
-// Accepts canonical names from the curated list, uTLS Str() forms, and common variants (hyphens, case).
 func ParseClientHelloID(s string) (utls.ClientHelloID, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {

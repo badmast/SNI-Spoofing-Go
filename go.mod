@@ -4,8 +4,9 @@ go 1.25.6
 
 require (
 	github.com/florianl/go-nfqueue/v2 v2.0.3
-	github.com/refraction-networking/utls v1.8.3
+	github.com/refraction-networking/utls v1.8.2
 	github.com/williamfhe/godivert v0.0.0-20181229124620-a48c5b872c73
+	golang.org/x/sys v0.31.0
 )
 
 require (
@@ -18,7 +19,4 @@ require (
 	golang.org/x/crypto v0.36.0 // indirect
 	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect
-	golang.org/x/sys v0.31.0 // indirect
 )
-
-replace github.com/refraction-networking/utls => ./utls

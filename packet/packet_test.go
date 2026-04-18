@@ -21,7 +21,6 @@ func TestBuildClientHelloRecord_ChromeAuto(t *testing.T) {
 	if record[0] != 0x16 {
 		t.Errorf("expected TLS record type 0x16, got 0x%02x", record[0])
 	}
-	// Browsers / RFC 8446 TLS 1.3: legacy_record_version 0x0303 on ClientHello record.
 	if record[1] != 0x03 || record[2] != 0x03 {
 		t.Errorf("expected record version 0x0303 (VersionTLS12), got 0x%02x%02x", record[1], record[2])
 	}
@@ -101,58 +100,46 @@ func TestCanonicalUTLSKey_noPlaceholderZero(t *testing.T) {
 }
 
 func TestTCPHeaderParsing(t *testing.T) {
-	// Construct a minimal IPv4+TCP packet (40 bytes)
-	// IPv4 header (20 bytes) + TCP header (20 bytes)
 	raw := make([]byte, 40)
 
-	// IPv4 header
-	raw[0] = 0x45 // Version 4, IHL 5 (20 bytes)
+	raw[0] = 0x45
 	raw[2] = 0x00
-	raw[3] = 40   // Total length
-	raw[4] = 0x12 // Identification
+	raw[3] = 40
+	raw[4] = 0x12
 	raw[5] = 0x34
-	raw[9] = 6 // Protocol: TCP
-	// Src IP: 192.168.1.1
+	raw[9] = 6
 	raw[12] = 192
 	raw[13] = 168
 	raw[14] = 1
 	raw[15] = 1
-	// Dst IP: 10.0.0.1
 	raw[16] = 10
 	raw[17] = 0
 	raw[18] = 0
 	raw[19] = 1
 
-	// TCP header at offset 20
-	raw[20] = 0x1F // Src port high byte (8000 = 0x1F40)
-	raw[21] = 0x40 // Src port low byte
-	raw[22] = 0x01 // Dst port high byte (443 = 0x01BB)
-	raw[23] = 0xBB // Dst port low byte
-	// Seq num: 0x12345678
+	raw[20] = 0x1F
+	raw[21] = 0x40
+	raw[22] = 0x01
+	raw[23] = 0xBB
 	raw[24] = 0x12
 	raw[25] = 0x34
 	raw[26] = 0x56
 	raw[27] = 0x78
-	// Ack num: 0x9ABCDEF0
 	raw[28] = 0x9A
 	raw[29] = 0xBC
 	raw[30] = 0xDE
 	raw[31] = 0xF0
-	// Data offset: 5 (20 bytes), flags: SYN+ACK (0x12)
-	raw[32] = 0x50 // Data offset = 5
-	raw[33] = 0x12 // SYN=1, ACK=1
+	raw[32] = 0x50
+	raw[33] = 0x12
 
-	// Test IP version
 	if v := IPVersion(raw); v != 4 {
 		t.Errorf("IPVersion: got %d, want 4", v)
 	}
 
-	// Test IP header length
 	if l := IPHeaderLen(raw); l != 20 {
 		t.Errorf("IPHeaderLen: got %d, want 20", l)
 	}
 
-	// Test IP addresses
 	srcIP := IPv4SrcAddr(raw)
 	if srcIP.String() != "192.168.1.1" {
 		t.Errorf("SrcIP: got %s, want 192.168.1.1", srcIP)
@@ -163,17 +150,14 @@ func TestTCPHeaderParsing(t *testing.T) {
 		t.Errorf("DstIP: got %s, want 10.0.0.1", dstIP)
 	}
 
-	// Test IP total length
 	if l := IPv4TotalLen(raw); l != 40 {
 		t.Errorf("IPv4TotalLen: got %d, want 40", l)
 	}
 
-	// Test IP identification
 	if id := IPv4Ident(raw); id != 0x1234 {
 		t.Errorf("IPv4Ident: got 0x%04x, want 0x1234", id)
 	}
 
-	// Test TCP ports
 	if p := TCPSrcPort(raw); p != 8000 {
 		t.Errorf("TCPSrcPort: got %d, want 8000", p)
 	}
@@ -181,7 +165,6 @@ func TestTCPHeaderParsing(t *testing.T) {
 		t.Errorf("TCPDstPort: got %d, want 443", p)
 	}
 
-	// Test TCP seq/ack
 	if s := TCPSeqNum(raw); s != 0x12345678 {
 		t.Errorf("TCPSeqNum: got 0x%08x, want 0x12345678", s)
 	}
@@ -189,7 +172,6 @@ func TestTCPHeaderParsing(t *testing.T) {
 		t.Errorf("TCPAckNum: got 0x%08x, want 0x9ABCDEF0", a)
 	}
 
-	// Test TCP flags
 	flags := GetTCPFlags(raw)
 	if !flags.SYN {
 		t.Error("expected SYN flag set")
@@ -207,18 +189,15 @@ func TestTCPHeaderParsing(t *testing.T) {
 		t.Error("expected PSH flag clear")
 	}
 
-	// Test TCP payload (no payload in this case)
 	if l := TCPPayloadLen(raw); l != 0 {
 		t.Errorf("TCPPayloadLen: got %d, want 0", l)
 	}
 
-	// Test modifying seq number
 	SetTCPSeqNum(raw, 0xDEADBEEF)
 	if s := TCPSeqNum(raw); s != 0xDEADBEEF {
 		t.Errorf("after SetTCPSeqNum: got 0x%08x, want 0xDEADBEEF", s)
 	}
 
-	// Test setting PSH flag
 	SetTCPFlag(raw, "psh", true)
 	flags = GetTCPFlags(raw)
 	if !flags.PSH {
@@ -228,7 +207,6 @@ func TestTCPHeaderParsing(t *testing.T) {
 		t.Error("SYN flag should still be set")
 	}
 
-	// Test clearing SYN flag
 	SetTCPFlag(raw, "syn", false)
 	flags = GetTCPFlags(raw)
 	if flags.SYN {
@@ -238,7 +216,6 @@ func TestTCPHeaderParsing(t *testing.T) {
 		t.Error("ACK flag should still be set")
 	}
 
-	// Test SetTCPPayload
 	payload := []byte("Hello, World!")
 	newRaw := SetTCPPayload(raw, payload)
 	if l := IPv4TotalLen(newRaw); l != uint16(40+len(payload)) {

@@ -4,6 +4,7 @@ package injection
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -24,40 +25,63 @@ import (
 )
 
 const (
-	nfqueueNum uint16 = 100
-	fwMark     int    = 0x1337
-
-	// Used when NIC MTU is unknown or computed MSS would be invalid.
 	fallbackTCPPayloadMax = 1000
 
-	// sysctlNetNFQueueMaxLen is net.netfilter.nf_queue_maxlen (default queue depth for nfqueue).
 	sysctlNetNFQueueMaxLen = "/proc/sys/net/netfilter/nf_queue_maxlen"
-	// sysctlNetCoreRmemMax is net.core.rmem_max (caps SO_RCVBUF for netlink).
-	sysctlNetCoreRmemMax = "/proc/sys/net/core/rmem_max"
+	sysctlNetCoreRmemMax   = "/proc/sys/net/core/rmem_max"
 
-	desiredNetlinkRcvBuf = 8 * 1024 * 1024
-	// Upper bound in case sysctl returns garbage.
+	desiredNetlinkRcvBuf    = 8 * 1024 * 1024
 	maxReasonableNFQueueLen = 65536
 )
 
-// FakeTcpInjector intercepts TCP packets via nfqueue and injects fake
-// TLS ClientHello packets using raw sockets on Linux.
+func randomNFQueueID() (uint16, error) {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint16(b[:]), nil
+}
+
+func randomFwMark() (int, error) {
+	var b [4]byte
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			return 0, err
+		}
+		m := int(binary.BigEndian.Uint32(b[:]))
+		if m != 0 {
+			return m, nil
+		}
+	}
+}
+
 type FakeTcpInjector struct {
 	nf          *nfqueue.Nfqueue
-	rawFd       int          // raw socket for injecting fake packets
-	Connections sync.Map     // map[connection.ConnID]*FakeInjectiveConnection
+	rawFd       int
+	Connections sync.Map
 	interfaceIP string
 	connectIP   string
 	connectPort uint16
-	// nicMTU is the egress interface MTU for interfaceIP (0 = unknown).
-	nicMTU int
-	ctx    context.Context
-	cancel context.CancelFunc
+	nicMTU      int
+	nfqueueNum  uint16
+	fwMark      int
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
-// NewFakeTcpInjector creates a new nfqueue-based injector and sets up iptables rules.
 func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*FakeTcpInjector, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	qid, err := randomNFQueueID()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("nfqueue queue id: %w", err)
+	}
+	mark, err := randomFwMark()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("fw mark: %w", err)
+	}
 
 	mtu := nicMTUForLocalIPv4(interfaceIP)
 	f := &FakeTcpInjector{
@@ -65,6 +89,8 @@ func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*Fak
 		connectIP:   connectIP,
 		connectPort: connectPort,
 		nicMTU:      mtu,
+		nfqueueNum:  qid,
+		fwMark:      mark,
 		ctx:         ctx,
 		cancel:      cancel,
 		rawFd:       -1,
@@ -75,17 +101,13 @@ func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*Fak
 		log.Printf("injector: could not resolve NIC MTU for %s, using fallback MSS %d", interfaceIP, fallbackTCPPayloadMax)
 	}
 
-	// Create raw socket for injecting fake packets
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create raw socket: %w", err)
 	}
-	// IP_HDRINCL: we provide the full IP header
 	syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
-	// Mark packets so iptables skips nfqueue for them
-	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_MARK, fwMark)
-	// Allow IP fragmentation when DF is cleared (oversized injection datagrams).
+	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_MARK, f.fwMark)
 	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DONT); err != nil {
 		syscall.Close(fd)
 		cancel()
@@ -93,14 +115,12 @@ func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*Fak
 	}
 	f.rawFd = fd
 
-	// Set up iptables rules
 	if err := f.setupIptables(); err != nil {
 		syscall.Close(fd)
 		cancel()
 		return nil, fmt.Errorf("failed to setup iptables: %w", err)
 	}
 
-	// Open nfqueue
 	maxQLen := nfqueueMaxQueueLenFromSysctl()
 	if maxQLen == 0 {
 		log.Printf("injector: nfqueue MaxQueueLen: default (unreadable sysctl %s)", sysctlNetNFQueueMaxLen)
@@ -108,7 +128,7 @@ func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*Fak
 		log.Printf("injector: nfqueue MaxQueueLen: %d (from %s)", maxQLen, sysctlNetNFQueueMaxLen)
 	}
 	cfg := nfqueue.Config{
-		NfQueue:      nfqueueNum,
+		NfQueue:      f.nfqueueNum,
 		MaxPacketLen: maxIPv4DatagramLen(),
 		MaxQueueLen:  maxQLen,
 		Copymode:     nfqueue.NfQnlCopyPacket,
@@ -120,8 +140,6 @@ func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*Fak
 		cancel()
 		return nil, fmt.Errorf("failed to open nfqueue: %w", err)
 	}
-	// Larger userspace recv buffer reduces "recvmsg: no buffer space available"
-	// when the kernel delivers nfqueue packets faster than we issue verdicts.
 	rcv := netlinkRecvBufFromSysctl()
 	if err := nf.Con.SetReadBuffer(rcv); err != nil {
 		log.Printf("injector: nfqueue SetReadBuffer(%d): %v (continuing with default)", rcv, err)
@@ -246,8 +264,8 @@ func segmentMSS(nicMTU int, template []byte) int {
 // setupIptables adds iptables rules to redirect relevant TCP packets to nfqueue.
 func (f *FakeTcpInjector) setupIptables() error {
 	port := fmt.Sprintf("%d", f.connectPort)
-	mark := fmt.Sprintf("0x%x", fwMark)
-	queueNum := fmt.Sprintf("%d", nfqueueNum)
+	mark := fmt.Sprintf("0x%x", f.fwMark)
+	queueNum := fmt.Sprintf("%d", f.nfqueueNum)
 
 	// OUTPUT: outbound packets to target (skip packets with our fwmark)
 	if err := runCmd("iptables", "-I", "OUTPUT", "-p", "tcp",
@@ -276,8 +294,8 @@ func (f *FakeTcpInjector) setupIptables() error {
 // cleanupIptables removes the iptables rules.
 func (f *FakeTcpInjector) cleanupIptables() {
 	port := fmt.Sprintf("%d", f.connectPort)
-	mark := fmt.Sprintf("0x%x", fwMark)
-	queueNum := fmt.Sprintf("%d", nfqueueNum)
+	mark := fmt.Sprintf("0x%x", f.fwMark)
+	queueNum := fmt.Sprintf("%d", f.nfqueueNum)
 
 	runCmd("iptables", "-D", "OUTPUT", "-p", "tcp",
 		"-d", f.connectIP, "--dport", port,
@@ -549,10 +567,10 @@ func (f *FakeTcpInjector) onOutboundPacket(id uint32, raw []byte, conn *FakeInje
 
 // fakeSendThread injects the fake ClientHello via raw socket.
 func (f *FakeTcpInjector) fakeSendThread(rawCopy []byte, conn *FakeInjectiveConnection) {
-	time.Sleep(1 * time.Millisecond)
-
 	conn.Mu.Lock()
 	defer conn.Mu.Unlock()
+
+	time.Sleep(1 * time.Millisecond)
 
 	if !conn.Monitor {
 		return
@@ -564,10 +582,27 @@ func (f *FakeTcpInjector) fakeSendThread(rawCopy []byte, conn *FakeInjectiveConn
 		return
 	}
 
-	if err := f.injectWrongSeqClientHello(rawCopy, conn); err != nil {
-		log.Printf("inject fake ClientHello: %v", err)
-		conn.AbortUnexpectedCloseLocked()
-		return
+	repeat := conn.FakeRepeat
+	if repeat < 1 {
+		repeat = 1
+	}
+	total := len(conn.FakeData)
+	mss := segmentMSS(f.nicMTU, rawCopy)
+	segPerInject := (total + mss - 1) / mss
+	if segPerInject < 1 {
+		segPerInject = 1
+	}
+	for i := 0; i < repeat; i++ {
+		if err := f.injectWrongSeqClientHello(rawCopy, conn); err != nil {
+			log.Printf("inject fake ClientHello: %v", err)
+			conn.AbortUnexpectedCloseLocked()
+			return
+		}
+		log.Printf("injector: fake TLS ClientHello %d/%d sent (%d bytes, %d TCP segment(s), MSS=%d)",
+			i+1, repeat, total, segPerInject, mss)
+		if i+1 < repeat {
+			time.Sleep(2 * time.Millisecond)
+		}
 	}
 	conn.FakeSent = true
 }

@@ -1,9 +1,4 @@
-// SNI-Spoofing-Go — Bypass DPI with fake TLS ClientHello injection.
-//
-// Cross-platform: Windows (WinDivert) and Linux/OpenWrt (nfqueue + raw socket).
-// Requires admin/root privileges.
-//
-// IPv4 only: listen/connect targets and all packet logic use IPv4.
+// TLS proxy: fake ClientHello injection (wrong-seq) + optional real CH fragmentation. IPv4 only; needs admin/root.
 package main
 
 import (
@@ -38,7 +33,11 @@ func usage() {
 	fmt.Fprintf(w, "  -connect <host:port>  upstream; hostname (SNI defaults to host) or IPv4 (-fake-sni required)\n\n")
 	fmt.Fprintf(w, "Optional:\n")
 	fmt.Fprintf(w, "  -fake-sni <hostname>  injected ClientHello SNI (overrides hostname from -connect)\n")
-	fmt.Fprintf(w, "  -utls <name>          TLS fingerprint (default: chrome); see list below\n\n")
+	fmt.Fprintf(w, "  -fake-repeat <n>      how many times to inject fake ClientHello (default 1)\n")
+	fmt.Fprintf(w, "  -utls <name>          TLS fingerprint (default: chrome); see list below\n")
+	fmt.Fprintf(w, "  -fragment             split real ClientHello: prefix, SNI chunks, suffix (default true)\n")
+	fmt.Fprintf(w, "  -fragment-delay       delay between writes (default 500ms)\n")
+	fmt.Fprintf(w, "  -sni-chunk            SNI hostname bytes per write after prefix (default 3; 0 = whole hostname in one write)\n\n")
 	fmt.Fprintf(w, "Examples:\n")
 	fmt.Fprintf(w, "  %s -listen 127.0.0.1:8080 -connect example.com:443\n", exe)
 	fmt.Fprintf(w, "  %s -listen 127.0.0.1:8080 -connect 198.51.100.2:443 -fake-sni allowed.example.com\n\n", exe)
@@ -52,10 +51,18 @@ func usage() {
 func main() {
 	flag.Usage = usage
 	var optListen, optConnect, optFakeSNI, optUTLS string
+	var fragment bool
+	var fragmentDelay time.Duration
+	var sniChunk int
+	var fakeRepeat int
 	flag.StringVar(&optListen, "listen", "", "listen address host:port (required)")
 	flag.StringVar(&optConnect, "connect", "", "upstream host:port (required)")
 	flag.StringVar(&optFakeSNI, "fake-sni", "", "injected ClientHello SNI (optional if -connect uses a hostname)")
+	flag.IntVar(&fakeRepeat, "fake-repeat", 1, "number of wrong-seq fake ClientHello injections before real traffic")
 	flag.StringVar(&optUTLS, "utls", "", "TLS fingerprint preset (see usage above; e.g. chrome_120, firefox)")
+	flag.BoolVar(&fragment, "fragment", true, "after fake SNI, read real ClientHello: send prefix, then SNI chunks, then suffix")
+	flag.DurationVar(&fragmentDelay, "fragment-delay", 500*time.Millisecond, "delay between ClientHello segment writes")
+	flag.IntVar(&sniChunk, "sni-chunk", packet.DefaultSNIChunkBytes, "SNI hostname bytes per TCP write (0 = entire hostname in one write)")
 	flag.Parse()
 
 	cliListen, cliConnect := false, false
@@ -78,6 +85,12 @@ func main() {
 	}
 	if !cliListen || !cliConnect {
 		log.Fatal("required flags: -listen and -connect")
+	}
+	if fakeRepeat < 1 {
+		log.Fatal("-fake-repeat must be at least 1")
+	}
+	if sniChunk < 0 {
+		log.Fatal("-sni-chunk must be >= 0 (0 = whole hostname in one write)")
 	}
 
 	cfg, err := config.ConnectFromCLI(optListen, optConnect, fakeSNIArg)
@@ -142,11 +155,10 @@ func main() {
 			tc.SetKeepAlivePeriod(11 * time.Second)
 		}
 
-		go handleConnection(incomingSock, cfg, interfaceIPv4, fakeSNI, clientHelloID, fakeInjector)
+		go handleConnection(incomingSock, cfg, interfaceIPv4, fakeSNI, clientHelloID, fakeInjector, fakeRepeat, fragment, fragmentDelay, sniChunk)
 	}
 }
 
-// handleConnection processes a single incoming proxy connection.
 func handleConnection(
 	incomingSock net.Conn,
 	cfg *config.Config,
@@ -154,6 +166,10 @@ func handleConnection(
 	fakeSNI []byte,
 	clientHelloID utls.ClientHelloID,
 	fakeInjector *injection.FakeTcpInjector,
+	fakeRepeat int,
+	fragment bool,
+	fragmentDelay time.Duration,
+	sniChunk int,
 ) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -170,7 +186,7 @@ func handleConnection(
 
 	outgoingSock, conn, srcPort, err := dialOutgoing(
 		interfaceIPv4, cfg.ConnectIP, cfg.ConnectPort,
-		fakeData, "wrong_seq", incomingSock, fakeInjector,
+		fakeData, "wrong_seq", fakeRepeat, incomingSock, fakeInjector,
 	)
 	if err != nil {
 		log.Printf("Failed to connect to %s:%d: %v", cfg.ConnectIP, cfg.ConnectPort, err)
@@ -228,6 +244,15 @@ func handleConnection(
 	conn.Mu.Unlock()
 	fakeInjector.Connections.Delete(key)
 
+	if fragment {
+		if err := forwardFragmentedClientHello(incomingSock, outgoingSock, fragmentDelay, sniChunk); err != nil {
+			log.Printf("ClientHello fragment: %v", err)
+			outgoingSock.Close()
+			incomingSock.Close()
+			return
+		}
+	}
+
 	done := make(chan struct{}, 2)
 	go func() { defer func() { done <- struct{}{} }(); relay(outgoingSock, incomingSock) }()
 	go func() { defer func() { done <- struct{}{} }(); relay(incomingSock, outgoingSock) }()
@@ -238,7 +263,19 @@ func handleConnection(
 	<-done
 }
 
-// relay copies data from src to dst until an error or EOF.
+func forwardFragmentedClientHello(incoming, outgoing net.Conn, delay time.Duration, sniChunkBytes int) error {
+	rec, err := packet.ReadFirstTLSRecord(incoming)
+	if err != nil {
+		return err
+	}
+	frags := packet.SplitClientHelloRecord(rec, sniChunkBytes)
+	var tcpFrag *net.TCPConn
+	if tc, ok := outgoing.(*net.TCPConn); ok {
+		tcpFrag = tc
+	}
+	return packet.WriteClientHelloFragments(outgoing, frags, delay, tcpFrag)
+}
+
 func relay(dst, src net.Conn) {
 	buf := make([]byte, 65575)
 	_, _ = io.CopyBuffer(dst, src, buf)
