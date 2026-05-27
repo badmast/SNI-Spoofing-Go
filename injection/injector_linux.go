@@ -45,7 +45,7 @@ func randomFwMark() (int, error) {
 		if _, err := rand.Read(b[:]); err != nil {
 			return 0, err
 		}
-		m := int(binary.BigEndian.Uint32(b[:]))
+		m := int(binary.BigEndian.Uint32(b[:]) & 0x7fffffff)
 		if m != 0 {
 			return m, nil
 		}
