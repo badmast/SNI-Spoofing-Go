@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,9 +15,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -569,7 +572,7 @@ func fetchFakeSNITraceIP(connectIP, fakeSNI string) (string, error) {
 		DialContext: func(ctx context.Context, networkName, addr string) (net.Conn, error) {
 			return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(connectIP, "443"))
 		},
-		TLSClientConfig:       &tls.Config{ServerName: host},
+		TLSClientConfig:       testTLSConfig(host),
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 		ForceAttemptHTTP2:     false,
@@ -596,6 +599,101 @@ func fetchFakeSNITraceIP(connectIP, fakeSNI string) (string, error) {
 	return parseCloudflareTraceIP(string(body))
 }
 
+var (
+	testRootCAsOnce sync.Once
+	testRootCAs     *x509.CertPool
+)
+
+func testTLSConfig(serverName string) *tls.Config {
+	return &tls.Config{
+		ServerName: serverName,
+		RootCAs:    methodTestRootCAs(),
+	}
+}
+
+func methodTestRootCAs() *x509.CertPool {
+	testRootCAsOnce.Do(func() {
+		pool, err := x509.SystemCertPool()
+		systemOK := err == nil && pool != nil
+		if !systemOK {
+			pool = x509.NewCertPool()
+		}
+
+		appended := appendCertFiles(pool, caBundleCandidates())
+		appended = appendCertDirs(pool, caDirCandidates()) || appended
+		if systemOK || appended {
+			testRootCAs = pool
+		}
+	})
+	return testRootCAs
+}
+
+func caBundleCandidates() []string {
+	return []string{
+		os.Getenv("SSL_CERT_FILE"),
+		"/data/data/com.termux/files/usr/etc/tls/cert.pem",
+		"/data/data/com.termux/files/usr/etc/ssl/cert.pem",
+		"/etc/ssl/certs/ca-certificates.crt",
+		"/etc/pki/tls/certs/ca-bundle.crt",
+		"/etc/ssl/ca-bundle.pem",
+		"/etc/pki/tls/cacert.pem",
+		"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+	}
+}
+
+func caDirCandidates() []string {
+	return []string{
+		os.Getenv("SSL_CERT_DIR"),
+		"/data/data/com.termux/files/usr/etc/tls/certs",
+		"/data/data/com.termux/files/usr/etc/ssl/certs",
+		"/etc/ssl/certs",
+		"/system/etc/security/cacerts",
+	}
+}
+
+func appendCertFiles(pool *x509.CertPool, paths []string) bool {
+	appended := false
+	for _, path := range paths {
+		if appendCertFile(pool, path) {
+			appended = true
+		}
+	}
+	return appended
+}
+
+func appendCertDirs(pool *x509.CertPool, dirs []string) bool {
+	appended := false
+	for _, dir := range dirs {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			if appendCertFile(pool, filepath.Join(dir, entry.Name())) {
+				appended = true
+			}
+		}
+	}
+	return appended
+}
+
+func appendCertFile(pool *x509.CertPool, path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return pool.AppendCertsFromPEM(pem)
+}
+
 func parseCloudflareTraceIP(body string) (string, error) {
 	for _, line := range strings.Split(body, "\n") {
 		key, val, ok := strings.Cut(strings.TrimSpace(line), "=")
@@ -616,6 +714,7 @@ func fetchArvanTraceIP() (string, error) {
 		DialContext: func(ctx context.Context, networkName, addr string) (net.Conn, error) {
 			return dialer.DialContext(ctx, "tcp4", addr)
 		},
+		TLSClientConfig:       testTLSConfig("arvancloud.ir"),
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 		ForceAttemptHTTP2:     false,
@@ -661,7 +760,7 @@ func fetchE2EDNSJSON(listenAddr string) error {
 		DialContext: func(ctx context.Context, networkName, addr string) (net.Conn, error) {
 			return dialer.DialContext(ctx, "tcp4", listenAddr)
 		},
-		TLSClientConfig:       &tls.Config{ServerName: "one.one.one.one"},
+		TLSClientConfig:       testTLSConfig("one.one.one.one"),
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 15 * time.Second,
 		ForceAttemptHTTP2:     false,
