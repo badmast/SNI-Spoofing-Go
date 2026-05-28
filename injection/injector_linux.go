@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -64,6 +65,8 @@ type FakeTcpInjector struct {
 	nicMTU          int
 	nfqueueNum      uint16
 	fwMark          int
+	fwRulePref      int
+	fwRuleTable     string
 	ctx             context.Context
 	cancel          context.CancelFunc
 	injectorReady   chan struct{}
@@ -128,7 +131,14 @@ func NewFakeTcpInjector(interfaceIP string, connectIPv4s []string, connectPort u
 	}
 	f.rawFd = fd
 
+	if err := f.ensureMarkedRoute(); err != nil {
+		syscall.Close(fd)
+		cancel()
+		return nil, fmt.Errorf("marked route: %w", err)
+	}
+
 	if err := f.setupIptables(); err != nil {
+		f.cleanupMarkedRoute()
 		syscall.Close(fd)
 		cancel()
 		return nil, fmt.Errorf("failed to setup iptables: %w", err)
@@ -147,6 +157,7 @@ func NewFakeTcpInjector(interfaceIP string, connectIPv4s []string, connectPort u
 	nf, err := nfqueue.Open(&cfg)
 	if err != nil {
 		f.cleanupIptables()
+		f.cleanupMarkedRoute()
 		syscall.Close(fd)
 		cancel()
 		return nil, fmt.Errorf("failed to open nfqueue: %w", err)
@@ -209,6 +220,74 @@ func netlinkRecvBufFromSysctl() int {
 		return int(max)
 	}
 	return desiredNetlinkRcvBuf
+}
+
+func (f *FakeTcpInjector) ensureMarkedRoute() error {
+	mark := fmt.Sprintf("0x%x", f.fwMark)
+	if err := runCmd("ip", "route", "get", f.connectIP, "mark", mark); err == nil {
+		return nil
+	}
+
+	table, err := routeTableForDestination(f.connectIP)
+	if err != nil {
+		return err
+	}
+	if table == "" {
+		return errors.New("marked route is unreachable and active route has no table")
+	}
+
+	basePref := 12000 + int(f.nfqueueNum%500)
+	var addErr error
+	for i := 0; i < 500; i++ {
+		pref := 12000 + ((basePref - 12000 + i) % 500)
+		prefStr := strconv.Itoa(pref)
+		addErr = runCmd("ip", "rule", "add", "pref", prefStr, "fwmark", mark, "lookup", table)
+		if addErr == nil {
+			f.fwRulePref = pref
+			f.fwRuleTable = table
+			break
+		}
+	}
+	if f.fwRulePref == 0 {
+		return addErr
+	}
+	if err := runCmd("ip", "route", "get", f.connectIP, "mark", mark); err != nil {
+		f.cleanupMarkedRoute()
+		return fmt.Errorf("marked route still unreachable after adding rule: %w", err)
+	}
+	log.Printf("route: fwmark %s lookup %s pref %d", mark, table, f.fwRulePref)
+	return nil
+}
+
+func routeTableForDestination(dst string) (string, error) {
+	out, err := exec.Command("ip", "route", "get", dst).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ip route get %s: %s: %w", dst, string(out), err)
+	}
+	return routeTableFromRouteGet(string(out)), nil
+}
+
+func routeTableFromRouteGet(out string) string {
+	fields := strings.Fields(string(out))
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "table" {
+			return fields[i+1]
+		}
+	}
+	return "main"
+}
+
+func (f *FakeTcpInjector) cleanupMarkedRoute() {
+	if f.fwRulePref == 0 || f.fwRuleTable == "" {
+		return
+	}
+	mark := fmt.Sprintf("0x%x", f.fwMark)
+	runCmd("ip", "rule", "del",
+		"pref", strconv.Itoa(f.fwRulePref),
+		"fwmark", mark,
+		"lookup", f.fwRuleTable)
+	f.fwRulePref = 0
+	f.fwRuleTable = ""
 }
 
 func (f *FakeTcpInjector) setupIptables() error {
@@ -301,6 +380,7 @@ func (f *FakeTcpInjector) Close() {
 			f.rawFd = -1
 		}
 		f.cleanupIptables()
+		f.cleanupMarkedRoute()
 	})
 }
 
